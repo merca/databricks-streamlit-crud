@@ -1,0 +1,61 @@
+resources:
+  # SQL files for setting up Unity Catalog resources
+  files:
+    setup_unity_catalog_table:
+      source: ./setup_table.sql
+      path: /Workspace${workspace.file_path}/sql/setup_table.sql
+      
+  # Jobs for initializing the database schema
+  jobs:
+    setup_database_job:
+      name: "Setup Unity Catalog Table - ${var.catalog}.${var.schema}"
+      description: "Initialize Unity Catalog table with row-level security for the CRUD app"
+      
+      tasks:
+        - task_key: setup_table
+          description: "Create Unity Catalog table with row-level security"
+          
+          sql_task:
+            warehouse_id: ${var.warehouse_id}
+            file:
+              source: ./setup_table.sql
+            
+            # Parameters that will be substituted in SQL
+            parameters:
+              catalog: ${var.catalog}
+              schema: ${var.schema}  
+              table_name: ${var.table_name}
+              
+        - task_key: grant_permissions
+          description: "Grant necessary permissions to users"
+          depends_on:
+            - task_key: setup_table
+            
+          sql_task:
+            warehouse_id: ${var.warehouse_id}
+            query: |
+              -- Grant permissions for the Unity Catalog resources
+              GRANT USAGE ON CATALOG ${var.catalog} TO `users`;
+              GRANT USAGE ON SCHEMA ${var.catalog}.${var.schema} TO `users`;
+              GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE ${var.catalog}.${var.schema}.${var.table_name} TO `users`;
+              
+              -- Grant execute permission on the row filter function  
+              GRANT EXECUTE ON FUNCTION ${var.catalog}.${var.schema}.user_data_row_filter TO `users`;
+      
+      # Job configuration
+      max_concurrent_runs: 1
+      timeout_seconds: 600
+      
+      # Email notifications for job completion
+      email_notifications:
+        on_success:
+          - ${workspace.current_user.userName}
+        on_failure:
+          - ${workspace.current_user.userName}
+          
+      # Job permissions
+      permissions:
+        - level: CAN_MANAGE
+          user_name: ${workspace.current_user.userName}
+        - level: CAN_VIEW
+          group_name: users

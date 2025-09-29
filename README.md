@@ -73,7 +73,44 @@ First, create the Unity Catalog table with row-level security:
 
 ### 4. Deployment to Databricks Apps
 
-#### Option A: Using Databricks Apps UI
+#### Option A: Using Databricks Asset Bundles (DAB) - Recommended
+
+This is the most automated and production-ready deployment method using Databricks Asset Bundles:
+
+1. **Install Databricks CLI**:
+   ```bash
+   pip install databricks-cli
+   ```
+
+2. **Configure authentication**:
+   ```bash
+   databricks configure --token
+   ```
+
+3. **Deploy using the provided scripts**:
+   
+   **Windows (PowerShell)**:
+   ```powershell
+   .\deploy.ps1 -Environment dev
+   ```
+   
+   **Linux/macOS (Bash)**:
+   ```bash
+   chmod +x deploy.sh
+   ./deploy.sh dev
+   ```
+
+4. **Available environments**: `dev`, `staging`, `prod`
+
+The DAB configuration automatically:
+- Creates and configures the Unity Catalog table with row-level security
+- Deploys the Streamlit application with proper permissions
+- Sets up environment variables and compute resources
+- Configures monitoring and health checks
+
+For detailed DAB deployment instructions, see [DEPLOYMENT.md](DEPLOYMENT.md).
+
+#### Option B: Using Databricks Apps UI
 
 1. Go to your Databricks workspace
 2. Navigate to **Apps** in the sidebar
@@ -84,7 +121,7 @@ First, create the Unity Catalog table with row-level security:
    - `requirements.txt` (dependencies)
    - `.env` (configuration - ensure no sensitive data is exposed)
 
-#### Option B: Using Databricks CLI
+#### Option C: Using Databricks CLI (Manual)
 
 1. Install Databricks CLI:
    ```bash

@@ -1,0 +1,74 @@
+resources:
+  apps:
+    unity_catalog_crud_app:
+      name: "Unity Catalog CRUD - ${var.catalog}.${var.schema}"
+      description: |
+        Production-ready Streamlit application for CRUD operations on 
+        Unity Catalog tables with row-level security and user authentication.
+        
+        Features:
+        - Complete CRUD operations (Create, Read, Update, Delete)
+        - Row-level security ensuring users only see their own data
+        - Unity Catalog integration with ${var.catalog}.${var.schema}.${var.table_name}
+        - User session management with Databricks authentication
+        - Comprehensive data validation and error handling
+        
+      source_code_path: ./
+      
+      # App configuration
+      config:
+        # Environment variables for the Streamlit app
+        env:
+          - name: UNITY_CATALOG_NAME
+            value: ${var.catalog}
+          - name: UNITY_SCHEMA_NAME  
+            value: ${var.schema}
+          - name: UNITY_TABLE_NAME
+            value: ${var.table_name}
+          - name: APP_DEBUG
+            value: "false"
+          - name: CONNECTION_TIMEOUT
+            value: "30"
+          - name: MAX_RETRIES
+            value: "3"
+            
+      # Resource requirements
+      compute:
+        spec:
+          # For development/small workloads
+          kind: serverless
+          # Uncomment for production with dedicated compute
+          # kind: shared_compute
+          # compute_key: shared_compute_default
+          
+      # Security and permissions
+      permissions:
+        - level: CAN_USE
+          group_name: users
+        - level: CAN_MANAGE  
+          group_name: admins
+        - level: CAN_MANAGE
+          user_name: ${workspace.current_user.userName}
+          
+      # App-specific settings
+      options:
+        # Auto-start the app when deployed
+        auto_start: true
+        
+        # Resource limits
+        max_concurrent_requests: 10
+        request_timeout_seconds: 60
+        
+        # Health check configuration
+        health_check:
+          path: "/"
+          initial_delay_seconds: 30
+          period_seconds: 10
+          timeout_seconds: 5
+          
+        # Logging configuration
+        logging:
+          level: INFO
+          
+      # Dependencies and requirements
+      requirements_file: requirements.txt
