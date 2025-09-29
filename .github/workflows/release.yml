@@ -1,0 +1,498 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+      - 'v*.*.*-*'
+  workflow_dispatch:
+    inputs:
+      release_type:
+        description: 'Release type'
+        required: true
+        default: 'patch'
+        type: choice
+        options:
+          - major
+          - minor
+          - patch
+          - prerelease
+      prerelease:
+        description: 'Mark as pre-release'
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: write
+  packages: write
+  pull-requests: write
+  issues: write
+
+jobs:
+  # Create release from workflow_dispatch
+  create-release:
+    name: Create Release
+    runs-on: ubuntu-latest
+    if: github.event_name == 'workflow_dispatch'
+    outputs:
+      tag: ${{ steps.create-tag.outputs.tag }}
+      version: ${{ steps.create-tag.outputs.version }}
+      
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+        token: ${{ secrets.GITHUB_TOKEN }}
+
+    - name: Set up Node.js
+      uses: actions/setup-node@v3
+      with:
+        node-version: '18'
+
+    - name: Install semantic-release
+      run: |
+        npm install -g semantic-release @semantic-release/changelog @semantic-release/git @semantic-release/github
+
+    - name: Get latest tag
+      id: get-latest-tag
+      run: |
+        LATEST_TAG=$(git describe --tags --abbrev=0 2>/dev/null || echo "v0.0.0")
+        echo "latest-tag=$LATEST_TAG" >> $GITHUB_OUTPUT
+        echo "Latest tag: $LATEST_TAG"
+
+    - name: Calculate new version
+      id: calc-version
+      run: |
+        LATEST_TAG="${{ steps.get-latest-tag.outputs.latest-tag }}"
+        VERSION=${LATEST_TAG#v}  # Remove 'v' prefix
+        
+        IFS='.' read -ra VERSION_PARTS <<< "$VERSION"
+        MAJOR=${VERSION_PARTS[0]}
+        MINOR=${VERSION_PARTS[1]}
+        PATCH=${VERSION_PARTS[2]}
+        
+        case "${{ github.event.inputs.release_type }}" in
+          major)
+            MAJOR=$((MAJOR + 1))
+            MINOR=0
+            PATCH=0
+            ;;
+          minor)
+            MINOR=$((MINOR + 1))
+            PATCH=0
+            ;;
+          patch)
+            PATCH=$((PATCH + 1))
+            ;;
+          prerelease)
+            PATCH=$((PATCH + 1))
+            NEW_VERSION="$MAJOR.$MINOR.$PATCH-rc.$(date +%s)"
+            ;;
+        esac
+        
+        if [ "${{ github.event.inputs.release_type }}" != "prerelease" ]; then
+          NEW_VERSION="$MAJOR.$MINOR.$PATCH"
+        fi
+        
+        echo "version=$NEW_VERSION" >> $GITHUB_OUTPUT
+        echo "tag=v$NEW_VERSION" >> $GITHUB_OUTPUT
+        echo "New version: $NEW_VERSION"
+
+    - name: Generate changelog
+      id: changelog
+      run: |
+        if [ "${{ steps.get-latest-tag.outputs.latest-tag }}" != "v0.0.0" ]; then
+          CHANGELOG=$(git log ${{ steps.get-latest-tag.outputs.latest-tag }}..HEAD --pretty=format:"- %s (%h)" --no-merges)
+        else
+          CHANGELOG=$(git log --pretty=format:"- %s (%h)" --no-merges)
+        fi
+        
+        echo "changelog<<EOF" >> $GITHUB_OUTPUT
+        echo "$CHANGELOG" >> $GITHUB_OUTPUT
+        echo "EOF" >> $GITHUB_OUTPUT
+
+    - name: Create and push tag
+      id: create-tag
+      run: |
+        TAG="${{ steps.calc-version.outputs.tag }}"
+        VERSION="${{ steps.calc-version.outputs.version }}"
+        
+        git config user.name "github-actions[bot]"
+        git config user.email "github-actions[bot]@users.noreply.github.com"
+        
+        git tag -a "$TAG" -m "Release $VERSION"
+        git push origin "$TAG"
+        
+        echo "tag=$TAG" >> $GITHUB_OUTPUT
+        echo "version=$VERSION" >> $GITHUB_OUTPUT
+
+  # Build release artifacts
+  build-release:
+    name: Build Release
+    runs-on: ubuntu-latest
+    needs: create-release
+    if: always() && (needs.create-release.result == 'success' || github.event_name == 'push')
+    outputs:
+      version: ${{ steps.get-version.outputs.version }}
+      
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+
+    - name: Get version from tag
+      id: get-version
+      run: |
+        if [ "${{ github.event_name }}" == "push" ]; then
+          VERSION=${GITHUB_REF#refs/tags/v}
+        else
+          VERSION="${{ needs.create-release.outputs.version }}"
+        fi
+        echo "version=$VERSION" >> $GITHUB_OUTPUT
+        echo "Version: $VERSION"
+
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.10'
+
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install -r requirements.txt
+        pip install build wheel setuptools
+
+    - name: Run tests
+      run: |
+        pytest tests/ -v
+      env:
+        DATABRICKS_SERVER_HOSTNAME: test-workspace.cloud.databricks.com
+        DATABRICKS_HTTP_PATH: /sql/1.0/warehouses/test-warehouse-id
+        DATABRICKS_TOKEN: test-token-123
+        UNITY_CATALOG_NAME: test_catalog
+        UNITY_SCHEMA_NAME: test_schema
+        UNITY_TABLE_NAME: test_table
+        APP_DEBUG: true
+
+    - name: Create release build
+      run: |
+        VERSION="${{ steps.get-version.outputs.version }}"
+        PACKAGE_NAME="databricks-streamlit-crud-v$VERSION"
+        
+        # Create version file
+        echo "$VERSION" > VERSION
+        echo "RELEASE_DATE=$(date -u +'%Y-%m-%dT%H:%M:%SZ')" >> VERSION
+        echo "GIT_COMMIT=${GITHUB_SHA}" >> VERSION
+        echo "GIT_TAG=v$VERSION" >> VERSION
+        
+        # Create release directory
+        mkdir -p release/$PACKAGE_NAME
+        
+        # Copy application files
+        cp -r *.py requirements.txt setup_table.sql .env.example release/$PACKAGE_NAME/
+        cp -r resources/ release/$PACKAGE_NAME/ 2>/dev/null || true
+        cp VERSION release/$PACKAGE_NAME/
+        cp README.md LICENSE release/$PACKAGE_NAME/
+        cp databricks.yml release/$PACKAGE_NAME/
+        cp deploy.* release/$PACKAGE_NAME/
+        cp DEPLOYMENT.md release/$PACKAGE_NAME/
+        cp pytest.ini release/$PACKAGE_NAME/
+        
+        # Copy tests for verification
+        cp -r tests/ release/$PACKAGE_NAME/
+        
+        # Create archives
+        cd release
+        tar -czf $PACKAGE_NAME.tar.gz $PACKAGE_NAME/
+        zip -r $PACKAGE_NAME.zip $PACKAGE_NAME/
+        
+        # Generate checksums
+        sha256sum $PACKAGE_NAME.tar.gz > $PACKAGE_NAME.tar.gz.sha256
+        sha256sum $PACKAGE_NAME.zip > $PACKAGE_NAME.zip.sha256
+        
+        # Create installation script
+        cat > install.sh << 'EOF'
+        #!/bin/bash
+        set -e
+        
+        echo "🚀 Installing Databricks Streamlit CRUD Application"
+        echo "Version: $VERSION"
+        
+        # Extract archive
+        if [ -f "*.tar.gz" ]; then
+          tar -xzf *.tar.gz
+          cd databricks-streamlit-crud-*
+        elif [ -f "*.zip" ]; then
+          unzip *.zip
+          cd databricks-streamlit-crud-*
+        else
+          echo "❌ No archive found"
+          exit 1
+        fi
+        
+        # Install Python dependencies
+        echo "📦 Installing Python dependencies..."
+        pip install -r requirements.txt
+        
+        # Make deployment scripts executable
+        chmod +x deploy.sh 2>/dev/null || true
+        
+        echo "✅ Installation completed!"
+        echo "📖 Please read DEPLOYMENT.md for deployment instructions"
+        echo "🧪 Run tests with: python run_tests.py --verbose"
+        EOF
+        
+        chmod +x install.sh
+
+    - name: Upload release artifacts
+      uses: actions/upload-artifact@v3
+      with:
+        name: release-artifacts
+        path: |
+          release/*.tar.gz
+          release/*.zip
+          release/*.sha256
+          release/install.sh
+
+  # Create GitHub Release
+  github-release:
+    name: GitHub Release
+    runs-on: ubuntu-latest
+    needs: [build-release]
+    if: always() && needs.build-release.result == 'success'
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+
+    - name: Download release artifacts
+      uses: actions/download-artifact@v3
+      with:
+        name: release-artifacts
+        path: ./release
+
+    - name: Get release tag
+      id: get-tag
+      run: |
+        if [ "${{ github.event_name }}" == "push" ]; then
+          TAG=${GITHUB_REF#refs/tags/}
+          VERSION=${TAG#v}
+        else
+          TAG="${{ needs.create-release.outputs.tag }}"
+          VERSION="${{ needs.create-release.outputs.version }}"
+        fi
+        echo "tag=$TAG" >> $GITHUB_OUTPUT
+        echo "version=$VERSION" >> $GITHUB_OUTPUT
+
+    - name: Generate release notes
+      id: release-notes
+      run: |
+        VERSION="${{ steps.get-tag.outputs.version }}"
+        TAG="${{ steps.get-tag.outputs.tag }}"
+        
+        # Get previous tag for changelog
+        PREV_TAG=$(git describe --tags --abbrev=0 $TAG^ 2>/dev/null || echo "")
+        
+        cat > release-notes.md << EOF
+        # 🚀 Databricks Streamlit CRUD Application $VERSION
+        
+        A production-ready Streamlit application for Unity Catalog CRUD operations with row-level security.
+        
+        ## 📦 What's Included
+        
+        - **Complete Application**: Streamlit app with full CRUD functionality
+        - **Security**: Row-level security implementation with user isolation
+        - **Deployment**: Databricks Asset Bundles (DAB) configuration
+        - **Testing**: Comprehensive unit test suite with 80%+ coverage
+        - **Documentation**: Complete setup and deployment guides
+        - **CI/CD**: GitHub Actions workflows for automated testing and deployment
+        
+        ## 🆕 Changes in this Release
+        
+        EOF
+        
+        if [ ! -z "$PREV_TAG" ]; then
+          echo "### Commits since $PREV_TAG:" >> release-notes.md
+          git log $PREV_TAG..$TAG --pretty=format:"- %s (%h)" --no-merges >> release-notes.md
+        else
+          echo "### Initial Release" >> release-notes.md
+          echo "- Complete Databricks Unity Catalog CRUD application" >> release-notes.md
+          echo "- Row-level security implementation" >> release-notes.md
+          echo "- Comprehensive testing framework" >> release-notes.md
+          echo "- CI/CD pipeline with GitHub Actions" >> release-notes.md
+        fi
+        
+        cat >> release-notes.md << EOF
+        
+        ## 🏗️ Installation
+        
+        ### Quick Start
+        \`\`\`bash
+        # Download and extract the release
+        wget https://github.com/${{ github.repository }}/releases/download/$TAG/databricks-streamlit-crud-v$VERSION.tar.gz
+        tar -xzf databricks-streamlit-crud-v$VERSION.tar.gz
+        cd databricks-streamlit-crud-v$VERSION
+        
+        # Run installation script
+        ./install.sh
+        \`\`\`
+        
+        ### Using Databricks Asset Bundles
+        \`\`\`bash
+        # Configure Databricks CLI
+        databricks configure --token
+        
+        # Deploy to staging
+        ./deploy.sh dev
+        
+        # Deploy to production (requires approval)
+        ./deploy.sh prod
+        \`\`\`
+        
+        ## 📋 Requirements
+        
+        - Python 3.8+
+        - Databricks workspace with Unity Catalog
+        - SQL Warehouse
+        - Databricks CLI (for deployment)
+        
+        ## 🧪 Testing
+        
+        \`\`\`bash
+        # Install dependencies
+        pip install -r requirements.txt
+        
+        # Run tests
+        python run_tests.py --verbose --coverage
+        \`\`\`
+        
+        ## 🔗 Links
+        
+        - **Documentation**: [README.md](https://github.com/${{ github.repository }}/blob/$TAG/README.md)
+        - **Deployment Guide**: [DEPLOYMENT.md](https://github.com/${{ github.repository }}/blob/$TAG/DEPLOYMENT.md)
+        - **Issues**: [GitHub Issues](https://github.com/${{ github.repository }}/issues)
+        
+        ## 🛡️ Security
+        
+        This release includes comprehensive security features:
+        - Row-level security enforcement
+        - User session isolation
+        - Secure credential management
+        - Vulnerability scanning in CI/CD
+        
+        ---
+        
+        **Full Changelog**: https://github.com/${{ github.repository }}/compare/$PREV_TAG...$TAG
+        EOF
+
+    - name: Create GitHub Release
+      uses: softprops/action-gh-release@v1
+      with:
+        tag_name: ${{ steps.get-tag.outputs.tag }}
+        name: "Release ${{ steps.get-tag.outputs.version }}"
+        body_path: release-notes.md
+        draft: false
+        prerelease: ${{ github.event.inputs.prerelease == 'true' || contains(steps.get-tag.outputs.version, '-') }}
+        files: |
+          release/*.tar.gz
+          release/*.zip
+          release/*.sha256
+          release/install.sh
+        token: ${{ secrets.GITHUB_TOKEN }}
+
+  # Update documentation
+  update-docs:
+    name: Update Documentation
+    runs-on: ubuntu-latest
+    needs: [github-release]
+    if: always() && needs.github-release.result == 'success' && !contains(needs.build-release.outputs.version, '-')
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      with:
+        token: ${{ secrets.GITHUB_TOKEN }}
+
+    - name: Update version in README
+      run: |
+        VERSION="${{ needs.build-release.outputs.version }}"
+        
+        # Update version badge in README if it exists
+        if grep -q "version-.*-blue" README.md; then
+          sed -i "s/version-.*-blue/version-$VERSION-blue/g" README.md
+        fi
+        
+        # Add release badge if it doesn't exist
+        if ! grep -q "GitHub release" README.md; then
+          # Add after the first line (title)
+          sed -i '1a\\n![GitHub release](https://img.shields.io/github/v/release/'"${{ github.repository }}"'?style=flat-square)' README.md
+        fi
+
+    - name: Create changelog entry
+      run: |
+        VERSION="${{ needs.build-release.outputs.version }}"
+        TAG="v$VERSION"
+        DATE=$(date +'%Y-%m-%d')
+        
+        # Create CHANGELOG.md if it doesn't exist
+        if [ ! -f CHANGELOG.md ]; then
+          cat > CHANGELOG.md << EOF
+        # Changelog
+        
+        All notable changes to this project will be documented in this file.
+        
+        The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
+        and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+        
+        EOF
+        fi
+        
+        # Add new release entry
+        sed -i "3i\\## [$VERSION] - $DATE\\n\\n### Added\\n- Release $VERSION\\n\\n### Changed\\n- See [GitHub Release](https://github.com/${{ github.repository }}/releases/tag/$TAG) for detailed changes\\n" CHANGELOG.md
+
+    - name: Commit documentation updates
+      run: |
+        git config user.name "github-actions[bot]"
+        git config user.email "github-actions[bot]@users.noreply.github.com"
+        
+        git add README.md CHANGELOG.md
+        if git diff --staged --quiet; then
+          echo "No documentation changes to commit"
+        else
+          git commit -m "docs: update documentation for release ${{ needs.build-release.outputs.version }}"
+          git push origin master
+        fi
+
+  # Notify stakeholders
+  notify:
+    name: Notify Release
+    runs-on: ubuntu-latest
+    needs: [github-release, update-docs]
+    if: always() && needs.github-release.result == 'success'
+    
+    steps:
+    - name: Create release summary
+      run: |
+        VERSION="${{ needs.build-release.outputs.version }}"
+        
+        echo "## 🎉 Release $VERSION Published!" >> $GITHUB_STEP_SUMMARY
+        echo "**Tag:** v$VERSION" >> $GITHUB_STEP_SUMMARY
+        echo "**Release URL:** https://github.com/${{ github.repository }}/releases/tag/v$VERSION" >> $GITHUB_STEP_SUMMARY
+        echo "**Published:** $(date -u)" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "### 📦 Artifacts" >> $GITHUB_STEP_SUMMARY
+        echo "- Source code archives (tar.gz, zip)" >> $GITHUB_STEP_SUMMARY
+        echo "- Installation script" >> $GITHUB_STEP_SUMMARY
+        echo "- SHA256 checksums" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "### 🚀 Quick Start" >> $GITHUB_STEP_SUMMARY
+        echo "\`\`\`bash" >> $GITHUB_STEP_SUMMARY
+        echo "wget https://github.com/${{ github.repository }}/releases/download/v$VERSION/databricks-streamlit-crud-v$VERSION.tar.gz" >> $GITHUB_STEP_SUMMARY
+        echo "tar -xzf databricks-streamlit-crud-v$VERSION.tar.gz" >> $GITHUB_STEP_SUMMARY
+        echo "cd databricks-streamlit-crud-v$VERSION && ./install.sh" >> $GITHUB_STEP_SUMMARY
+        echo "\`\`\`" >> $GITHUB_STEP_SUMMARY

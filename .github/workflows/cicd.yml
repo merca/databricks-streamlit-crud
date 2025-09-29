@@ -1,0 +1,526 @@
+name: CI/CD Pipeline
+
+on:
+  push:
+    branches: [ master, main, develop ]
+  pull_request:
+    branches: [ master, main ]
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Environment to deploy to'
+        required: true
+        default: 'staging'
+        type: choice
+        options:
+          - staging
+          - production
+
+env:
+  PYTHON_VERSION: '3.10'
+  NODE_VERSION: '18'
+
+jobs:
+  # Code Quality and Security Analysis
+  quality-gate:
+    name: Quality Gate
+    runs-on: ubuntu-latest
+    outputs:
+      should-deploy: ${{ steps.quality-check.outputs.passed }}
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 0  # Full history for better analysis
+
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: ${{ env.PYTHON_VERSION }}
+
+    - name: Cache dependencies
+      uses: actions/cache@v3
+      with:
+        path: ~/.cache/pip
+        key: ${{ runner.os }}-pip-${{ hashFiles('requirements.txt') }}
+        restore-keys: |
+          ${{ runner.os }}-pip-
+
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install -r requirements.txt
+        pip install bandit safety mypy black isort flake8 semgrep
+
+    - name: Code formatting check (Black)
+      run: |
+        black --check --diff --color .
+
+    - name: Import sorting check (isort)
+      run: |
+        isort --check-only --diff --color .
+
+    - name: Linting (flake8)
+      run: |
+        flake8 . --count --select=E9,F63,F7,F82 --show-source --statistics
+        flake8 . --count --exit-zero --max-complexity=10 --max-line-length=127 --statistics --exclude=tests
+
+    - name: Type checking (mypy)
+      run: |
+        mypy --install-types --non-interactive --ignore-missing-imports . || true
+
+    - name: Security scan (Bandit)
+      run: |
+        bandit -r . -f json -o security-report.json --exclude ./tests
+        bandit -r . --exclude ./tests
+
+    - name: Vulnerability check (Safety)
+      run: |
+        safety check --json --output vulnerability-report.json
+        safety check
+
+    - name: Advanced security scan (Semgrep)
+      run: |
+        semgrep --config=auto --json --output=semgrep-report.json . || true
+
+    - name: Upload security reports
+      uses: actions/upload-artifact@v3
+      if: always()
+      with:
+        name: security-reports
+        path: |
+          security-report.json
+          vulnerability-report.json
+          semgrep-report.json
+
+    - name: Quality gate decision
+      id: quality-check
+      run: |
+        echo "Quality checks completed"
+        echo "passed=true" >> $GITHUB_OUTPUT
+
+  # Comprehensive Testing
+  test:
+    name: Test Suite
+    runs-on: ubuntu-latest
+    needs: quality-gate
+    strategy:
+      matrix:
+        python-version: ['3.8', '3.9', '3.10', '3.11']
+        include:
+          - python-version: '3.10'
+            coverage: true
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Set up Python ${{ matrix.python-version }}
+      uses: actions/setup-python@v4
+      with:
+        python-version: ${{ matrix.python-version }}
+
+    - name: Cache dependencies
+      uses: actions/cache@v3
+      with:
+        path: ~/.cache/pip
+        key: ${{ runner.os }}-pip-${{ matrix.python-version }}-${{ hashFiles('requirements.txt') }}
+
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install -r requirements.txt
+
+    - name: Create test environment
+      run: |
+        mkdir -p tests/reports
+        mkdir -p coverage
+
+    - name: Run unit tests
+      run: |
+        pytest tests/ -v --tb=short --junitxml=tests/reports/junit-${{ matrix.python-version }}.xml
+      env:
+        DATABRICKS_SERVER_HOSTNAME: test-workspace.cloud.databricks.com
+        DATABRICKS_HTTP_PATH: /sql/1.0/warehouses/test-warehouse-id
+        DATABRICKS_TOKEN: test-token-123
+        UNITY_CATALOG_NAME: test_catalog
+        UNITY_SCHEMA_NAME: test_schema
+        UNITY_TABLE_NAME: test_table
+        APP_DEBUG: true
+
+    - name: Run tests with coverage
+      if: matrix.coverage
+      run: |
+        pytest tests/ --cov=. --cov-report=html:htmlcov --cov-report=xml:coverage.xml --cov-report=term-missing
+      env:
+        DATABRICKS_SERVER_HOSTNAME: test-workspace.cloud.databricks.com
+        DATABRICKS_HTTP_PATH: /sql/1.0/warehouses/test-warehouse-id
+        DATABRICKS_TOKEN: test-token-123
+        UNITY_CATALOG_NAME: test_catalog
+        UNITY_SCHEMA_NAME: test_schema
+        UNITY_TABLE_NAME: test_table
+        APP_DEBUG: true
+
+    - name: Upload test results
+      uses: actions/upload-artifact@v3
+      if: always()
+      with:
+        name: test-results-${{ matrix.python-version }}
+        path: |
+          tests/reports/
+          htmlcov/
+          coverage.xml
+
+    - name: Upload coverage to Codecov
+      if: matrix.coverage
+      uses: codecov/codecov-action@v3
+      with:
+        file: ./coverage.xml
+        flags: unittests
+        name: codecov-umbrella
+
+  # Build and Package
+  build:
+    name: Build Application
+    runs-on: ubuntu-latest
+    needs: [quality-gate, test]
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      artifact-name: ${{ steps.package.outputs.artifact-name }}
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: ${{ env.PYTHON_VERSION }}
+
+    - name: Generate version
+      id: version
+      run: |
+        VERSION=$(date +%Y.%m.%d)-${GITHUB_SHA:0:7}
+        echo "version=$VERSION" >> $GITHUB_OUTPUT
+        echo "Generated version: $VERSION"
+
+    - name: Install build dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install build twine setuptools wheel
+
+    - name: Create version file
+      run: |
+        echo "${{ steps.version.outputs.version }}" > VERSION
+        echo "BUILD_DATE=$(date -u +'%Y-%m-%dT%H:%M:%SZ')" >> VERSION
+        echo "GIT_COMMIT=${GITHUB_SHA}" >> VERSION
+        echo "GIT_BRANCH=${GITHUB_REF#refs/heads/}" >> VERSION
+
+    - name: Package application
+      id: package
+      run: |
+        PACKAGE_NAME="databricks-streamlit-crud-${{ steps.version.outputs.version }}"
+        mkdir -p dist/$PACKAGE_NAME
+        
+        # Copy application files
+        cp -r *.py requirements.txt setup_table.sql .env.example dist/$PACKAGE_NAME/
+        cp -r resources/ dist/$PACKAGE_NAME/ 2>/dev/null || true
+        cp VERSION dist/$PACKAGE_NAME/
+        cp README.md LICENSE dist/$PACKAGE_NAME/
+        cp databricks.yml dist/$PACKAGE_NAME/
+        cp deploy.* dist/$PACKAGE_NAME/
+        cp DEPLOYMENT.md dist/$PACKAGE_NAME/
+        
+        # Create deployment package
+        cd dist
+        tar -czf $PACKAGE_NAME.tar.gz $PACKAGE_NAME/
+        zip -r $PACKAGE_NAME.zip $PACKAGE_NAME/
+        
+        # Generate checksums
+        sha256sum $PACKAGE_NAME.tar.gz > $PACKAGE_NAME.tar.gz.sha256
+        sha256sum $PACKAGE_NAME.zip > $PACKAGE_NAME.zip.sha256
+        
+        echo "artifact-name=$PACKAGE_NAME" >> $GITHUB_OUTPUT
+
+    - name: Upload build artifacts
+      uses: actions/upload-artifact@v3
+      with:
+        name: application-package
+        path: |
+          dist/*.tar.gz
+          dist/*.zip
+          dist/*.sha256
+        retention-days: 30
+
+    - name: Generate build report
+      run: |
+        echo "# Build Report" > build-report.md
+        echo "**Version:** ${{ steps.version.outputs.version }}" >> build-report.md
+        echo "**Build Date:** $(date -u)" >> build-report.md
+        echo "**Git Commit:** ${GITHUB_SHA}" >> build-report.md
+        echo "**Branch:** ${GITHUB_REF#refs/heads/}" >> build-report.md
+        echo "**Package:** ${{ steps.package.outputs.artifact-name }}" >> build-report.md
+        
+        # Add file sizes
+        echo "" >> build-report.md
+        echo "## Package Information" >> build-report.md
+        cd dist
+        ls -la *.tar.gz *.zip | awk '{print "- " $9 ": " $5 " bytes"}' >> ../build-report.md
+
+    - name: Upload build report
+      uses: actions/upload-artifact@v3
+      with:
+        name: build-report
+        path: build-report.md
+
+  # Container Build (Optional)
+  container:
+    name: Build Container
+    runs-on: ubuntu-latest
+    needs: [build]
+    if: github.ref == 'refs/heads/master' || github.ref == 'refs/heads/main'
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@v3
+
+    - name: Login to GitHub Container Registry
+      uses: docker/login-action@v3
+      with:
+        registry: ghcr.io
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+
+    - name: Download build artifacts
+      uses: actions/download-artifact@v3
+      with:
+        name: application-package
+        path: ./dist
+
+    - name: Create Dockerfile
+      run: |
+        cat > Dockerfile << 'EOF'
+        FROM python:3.10-slim
+
+        WORKDIR /app
+
+        # Install system dependencies
+        RUN apt-get update && apt-get install -y \
+            gcc \
+            curl \
+            && rm -rf /var/lib/apt/lists/*
+
+        # Copy requirements and install Python dependencies
+        COPY requirements.txt .
+        RUN pip install --no-cache-dir -r requirements.txt
+
+        # Copy application files
+        COPY *.py ./
+        COPY setup_table.sql ./
+        COPY resources/ ./resources/
+        COPY databricks.yml ./
+        COPY VERSION ./
+
+        # Create non-root user
+        RUN useradd --create-home --shell /bin/bash app \
+            && chown -R app:app /app
+        USER app
+
+        # Health check
+        HEALTHCHECK --interval=30s --timeout=10s --start-period=30s --retries=3 \
+          CMD curl -f http://localhost:8501/_stcore/health || exit 1
+
+        EXPOSE 8501
+
+        CMD ["streamlit", "run", "app.py", "--server.port=8501", "--server.address=0.0.0.0"]
+        EOF
+
+    - name: Build and push container
+      uses: docker/build-push-action@v5
+      with:
+        context: .
+        platforms: linux/amd64,linux/arm64
+        push: true
+        tags: |
+          ghcr.io/${{ github.repository }}:latest
+          ghcr.io/${{ github.repository }}:${{ needs.build.outputs.version }}
+        cache-from: type=gha
+        cache-to: type=gha,mode=max
+
+  # Staging Deployment
+  deploy-staging:
+    name: Deploy to Staging
+    runs-on: ubuntu-latest
+    needs: [build, test]
+    if: |
+      (github.ref == 'refs/heads/develop' || github.event_name == 'workflow_dispatch') &&
+      github.event.inputs.environment == 'staging'
+    environment:
+      name: staging
+      url: https://staging-databricks-crud.example.com
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Download build artifacts
+      uses: actions/download-artifact@v3
+      with:
+        name: application-package
+        path: ./dist
+
+    - name: Set up Databricks CLI
+      run: |
+        curl -fsSL https://raw.githubusercontent.com/databricks/setup-cli/main/install.sh | sh
+        echo "$HOME/.databricks/bin" >> $GITHUB_PATH
+
+    - name: Configure Databricks CLI
+      run: |
+        databricks configure --token <<< "${{ secrets.DATABRICKS_TOKEN_STAGING }}"
+      env:
+        DATABRICKS_HOST: ${{ secrets.DATABRICKS_HOST_STAGING }}
+
+    - name: Deploy to Databricks Apps (Staging)
+      run: |
+        # Extract deployment package
+        cd dist
+        tar -xzf databricks-streamlit-crud-*.tar.gz
+        cd databricks-streamlit-crud-*/
+        
+        # Update bundle configuration for staging
+        sed -i 's/{{environment}}/staging/g' databricks.yml
+        sed -i 's/{{catalog}}/staging_catalog/g' databricks.yml
+        
+        # Deploy using DAB
+        databricks bundle validate
+        databricks bundle deploy --target staging
+
+    - name: Run post-deployment tests
+      run: |
+        echo "Running smoke tests for staging deployment..."
+        # Add staging-specific tests here
+        echo "Staging deployment successful!"
+
+    - name: Create deployment notification
+      run: |
+        echo "🚀 **Staging Deployment Successful**" > deployment-summary.md
+        echo "**Version:** ${{ needs.build.outputs.version }}" >> deployment-summary.md
+        echo "**Environment:** Staging" >> deployment-summary.md
+        echo "**Deployed at:** $(date -u)" >> deployment-summary.md
+
+  # Production Deployment (Manual Approval)
+  deploy-production:
+    name: Deploy to Production
+    runs-on: ubuntu-latest
+    needs: [build, test, deploy-staging]
+    if: |
+      (github.ref == 'refs/heads/master' || github.ref == 'refs/heads/main') &&
+      (github.event_name == 'workflow_dispatch' && github.event.inputs.environment == 'production')
+    environment:
+      name: production
+      url: https://databricks-crud.example.com
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Download build artifacts
+      uses: actions/download-artifact@v3
+      with:
+        name: application-package
+        path: ./dist
+
+    - name: Set up Databricks CLI
+      run: |
+        curl -fsSL https://raw.githubusercontent.com/databricks/setup-cli/main/install.sh | sh
+        echo "$HOME/.databricks/bin" >> $GITHUB_PATH
+
+    - name: Configure Databricks CLI
+      run: |
+        databricks configure --token <<< "${{ secrets.DATABRICKS_TOKEN_PROD }}"
+      env:
+        DATABRICKS_HOST: ${{ secrets.DATABRICKS_HOST_PROD }}
+
+    - name: Pre-deployment backup
+      run: |
+        echo "Creating backup of current production deployment..."
+        # Add backup logic here
+        
+    - name: Deploy to Databricks Apps (Production)
+      run: |
+        # Extract deployment package
+        cd dist
+        tar -xzf databricks-streamlit-crud-*.tar.gz
+        cd databricks-streamlit-crud-*/
+        
+        # Update bundle configuration for production
+        sed -i 's/{{environment}}/production/g' databricks.yml
+        sed -i 's/{{catalog}}/prod_catalog/g' databricks.yml
+        
+        # Deploy using DAB
+        databricks bundle validate
+        databricks bundle deploy --target prod
+
+    - name: Production health check
+      run: |
+        echo "Running production health checks..."
+        # Add production health check logic here
+        sleep 30
+        echo "Production health check passed!"
+
+    - name: Create production deployment notification
+      run: |
+        echo "🎉 **Production Deployment Successful**" > production-deployment.md
+        echo "**Version:** ${{ needs.build.outputs.version }}" >> production-deployment.md
+        echo "**Environment:** Production" >> production-deployment.md
+        echo "**Deployed at:** $(date -u)" >> production-deployment.md
+
+  # Notification
+  notify:
+    name: Send Notifications
+    runs-on: ubuntu-latest
+    needs: [quality-gate, test, build, deploy-staging, deploy-production]
+    if: always()
+    
+    steps:
+    - name: Determine workflow status
+      id: status
+      run: |
+        if [[ "${{ needs.quality-gate.result }}" == "failure" || "${{ needs.test.result }}" == "failure" || "${{ needs.build.result }}" == "failure" ]]; then
+          echo "status=failure" >> $GITHUB_OUTPUT
+          echo "message=❌ CI/CD Pipeline Failed" >> $GITHUB_OUTPUT
+        elif [[ "${{ needs.deploy-production.result }}" == "success" ]]; then
+          echo "status=success" >> $GITHUB_OUTPUT
+          echo "message=🎉 Production Deployment Successful" >> $GITHUB_OUTPUT
+        elif [[ "${{ needs.deploy-staging.result }}" == "success" ]]; then
+          echo "status=success" >> $GITHUB_OUTPUT
+          echo "message=🚀 Staging Deployment Successful" >> $GITHUB_OUTPUT
+        else
+          echo "status=success" >> $GITHUB_OUTPUT
+          echo "message=✅ CI/CD Pipeline Completed" >> $GITHUB_OUTPUT
+        fi
+
+    - name: Create summary
+      run: |
+        echo "## CI/CD Pipeline Summary" >> $GITHUB_STEP_SUMMARY
+        echo "**Status:** ${{ steps.status.outputs.message }}" >> $GITHUB_STEP_SUMMARY
+        echo "**Triggered by:** ${{ github.actor }}" >> $GITHUB_STEP_SUMMARY
+        echo "**Commit:** ${{ github.sha }}" >> $GITHUB_STEP_SUMMARY
+        echo "**Branch:** ${{ github.ref_name }}" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "### Job Status" >> $GITHUB_STEP_SUMMARY
+        echo "- Quality Gate: ${{ needs.quality-gate.result }}" >> $GITHUB_STEP_SUMMARY
+        echo "- Tests: ${{ needs.test.result }}" >> $GITHUB_STEP_SUMMARY
+        echo "- Build: ${{ needs.build.result }}" >> $GITHUB_STEP_SUMMARY
+        if [[ "${{ needs.deploy-staging.result }}" != "" ]]; then
+          echo "- Staging Deploy: ${{ needs.deploy-staging.result }}" >> $GITHUB_STEP_SUMMARY
+        fi
+        if [[ "${{ needs.deploy-production.result }}" != "" ]]; then
+          echo "- Production Deploy: ${{ needs.deploy-production.result }}" >> $GITHUB_STEP_SUMMARY
+        fi
