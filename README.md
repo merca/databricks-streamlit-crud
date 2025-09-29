@@ -249,6 +249,111 @@ Set `APP_DEBUG=true` in your `.env` file to enable additional logging and error 
 - Delta table auto-optimization is enabled
 - Consider partitioning for large datasets
 
+## Testing
+
+The application includes comprehensive unit tests covering configuration, database operations, and UI components.
+
+### Running Tests Locally
+
+1. **Install testing dependencies**:
+   ```bash
+   pip install -r requirements.txt
+   ```
+
+2. **Run all tests**:
+   ```bash
+   pytest
+   ```
+
+3. **Run tests with coverage**:
+   ```bash
+   pytest --cov=. --cov-report=html
+   ```
+
+4. **Run specific test categories**:
+   ```bash
+   # Unit tests only
+   pytest -m unit
+   
+   # Configuration tests
+   pytest -m config
+   
+   # Database tests
+   pytest -m database
+   
+   # UI component tests
+   pytest -m ui
+   ```
+
+### Test Structure
+
+```
+tests/
+├── __init__.py              # Tests package
+├── conftest.py              # Pytest fixtures and configuration
+├── test_config.py           # Configuration module tests
+├── test_database_operations.py  # Database and CRUD tests
+└── test_streamlit_app.py    # UI and app component tests
+```
+
+### Test Coverage
+
+The tests cover:
+- ✅ **Configuration Management**: Environment variable loading, validation, defaults
+- ✅ **Database Operations**: CRUD operations, connection handling, error scenarios
+- ✅ **Row-Level Security**: User ownership enforcement across all operations
+- ✅ **UI Components**: Form validation, session management, user interactions
+- ✅ **Error Handling**: Database failures, invalid data, network issues
+- ✅ **Security Features**: User session management, data isolation
+
+### Continuous Integration
+
+Automated testing runs on:
+- **Push to main/master branch**
+- **Pull requests**
+- **Python versions**: 3.8, 3.9, 3.10, 3.11
+
+The CI pipeline includes:
+- **Unit Tests**: Full test suite with coverage reporting
+- **Code Linting**: flake8, black, isort for code quality
+- **Security Scanning**: bandit and safety for vulnerability detection
+- **Coverage Reports**: Uploaded to Codecov for tracking
+
+### Writing New Tests
+
+1. **Follow naming conventions**:
+   - Test files: `test_*.py`
+   - Test classes: `Test*`
+   - Test functions: `test_*`
+
+2. **Use appropriate fixtures**:
+   ```python
+   def test_database_operation(self, mock_databricks_connection):
+       # Test implementation
+   ```
+
+3. **Add test markers**:
+   ```python
+   @pytest.mark.unit
+   @pytest.mark.database
+   def test_create_record(self):
+       # Test implementation
+   ```
+
+4. **Mock external dependencies**:
+   ```python
+   @patch('app.sql.connect')
+   def test_connection(self, mock_connect):
+       # Test implementation
+   ```
+
+### Test Reports
+
+After running tests, you can view:
+- **HTML Coverage Report**: `htmlcov/index.html`
+- **Test Report**: `tests/reports/report.html`
+- **Coverage XML**: `coverage.xml`
+
 ## Security Best Practices
 
 1. **Never commit `.env` files** with real credentials to version control

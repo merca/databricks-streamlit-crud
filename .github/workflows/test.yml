@@ -1,0 +1,133 @@
+name: Tests
+
+on:
+  push:
+    branches: [ master, main ]
+  pull_request:
+    branches: [ master, main ]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ['3.8', '3.9', '3.10', '3.11']
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Set up Python ${{ matrix.python-version }}
+      uses: actions/setup-python@v4
+      with:
+        python-version: ${{ matrix.python-version }}
+
+    - name: Cache pip dependencies
+      uses: actions/cache@v3
+      with:
+        path: ~/.cache/pip
+        key: ${{ runner.os }}-pip-${{ hashFiles('requirements.txt') }}
+        restore-keys: |
+          ${{ runner.os }}-pip-
+
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install -r requirements.txt
+
+    - name: Create test reports directory
+      run: mkdir -p tests/reports
+
+    - name: Run unit tests
+      run: |
+        pytest tests/ -v --cov=. --cov-report=xml --cov-report=html --html=tests/reports/report.html --self-contained-html
+      env:
+        # Mock environment variables for testing
+        DATABRICKS_SERVER_HOSTNAME: test-workspace.cloud.databricks.com
+        DATABRICKS_HTTP_PATH: /sql/1.0/warehouses/test-warehouse-id
+        DATABRICKS_TOKEN: test-token-123
+        UNITY_CATALOG_NAME: test_catalog
+        UNITY_SCHEMA_NAME: test_schema
+        UNITY_TABLE_NAME: test_table
+        APP_DEBUG: true
+
+    - name: Upload coverage reports to Codecov
+      uses: codecov/codecov-action@v3
+      with:
+        file: ./coverage.xml
+        flags: unittests
+        name: codecov-umbrella
+        fail_ci_if_error: false
+
+    - name: Upload test results
+      uses: actions/upload-artifact@v3
+      if: always()
+      with:
+        name: test-results-python-${{ matrix.python-version }}
+        path: |
+          tests/reports/
+          htmlcov/
+          coverage.xml
+
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.10'
+
+    - name: Install linting dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install flake8 black isort mypy
+
+    - name: Lint with flake8
+      run: |
+        # Stop the build if there are Python syntax errors or undefined names
+        flake8 . --count --select=E9,F63,F7,F82 --show-source --statistics
+        # Exit-zero treats all errors as warnings. The GitHub editor is 127 chars wide
+        flake8 . --count --exit-zero --max-complexity=10 --max-line-length=127 --statistics --exclude=tests
+
+    - name: Check code formatting with black
+      run: |
+        black --check --diff .
+
+    - name: Check import sorting with isort
+      run: |
+        isort --check-only --diff .
+
+  security:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.10'
+
+    - name: Install security scanning tools
+      run: |
+        python -m pip install --upgrade pip
+        pip install bandit safety
+
+    - name: Run bandit security checks
+      run: |
+        bandit -r . -f json -o bandit-report.json || true
+        bandit -r . --exclude ./tests
+
+    - name: Run safety vulnerability checks
+      run: |
+        safety check --json --output safety-report.json || true
+        safety check
+
+    - name: Upload security reports
+      uses: actions/upload-artifact@v3
+      if: always()
+      with:
+        name: security-reports
+        path: |
+          bandit-report.json
+          safety-report.json

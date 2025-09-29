@@ -49,6 +49,14 @@ coverage.xml
 .hypothesis/
 .pytest_cache/
 
+# Test reports and artifacts
+tests/reports/
+.pytest_cache/
+*.pyc
+bandit-report.json
+safety-report.json
+test-results-*/
+
 # Translations
 *.mo
 *.pot
